@@ -96,13 +96,13 @@ function isAdministrator(interaction) {
   return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) === true;
 }
 
-// ضع توكن البوت بين علامتي الاقتباس هنا.
-const TOKEN = "MTU1MTY0ODUwNTY2NjIxMTkzMA.G8d_en.EZNObewZJSly1C_aJoDwjpGXZPJSq6RzuUVkaE";
-// ضع أيدي السيرفر بين علامتي الاقتباس هنا.
+// قراءة التوكن بأمان من متغيرات البيئة في Render
+const TOKEN = process.env.TOKEN;
+// أيدي السيرفر الخاص بك مثبت هنا بدقة
 const GUILD_ID = "1339621671480332392";
 
 if (!TOKEN) {
-  throw new Error('متغير DISCORD_TOKEN غير موجود. أضف توكن البوت إلى متغيرات البيئة ثم أعد التشغيل.');
+  throw new Error('متغير TOKEN غير موجود. أضف توكن البوت إلى متغيرات البيئة في موقع Render ثم أعد التشغيل.');
 }
 
 const commands = [
@@ -114,7 +114,7 @@ const commands = [
     .addChannelOption(option => 
       option.setName('archive-channel').setDescription('روم الأرشيف التلقائي').setRequired(true))
     .addChannelOption(option =>
-      option.setName('public-channel').setDescription('الروم العام لنشر التعميمات المقبولة').setRequired(true)),
+      option.setName('public-channel').setDescription('روم العام لنشر التعميمات المقبولة').setRequired(true)),
   new SlashCommandBuilder()
     .setName('add-shortcut')
     .setDescription('إضافة اختصار إلى قائمة الاختصارات')
@@ -129,7 +129,6 @@ const rest = new REST({ version: '10' }).setToken(TOKEN);
 client.once('ready', async () => {
   console.log(`تم تسجيل الدخول بنجاح باسم ${client.user.tag}`);
   try {
-    // التسجيل داخل السيرفر يظهر فوراً، بخلاف التسجيل العالمي الذي قد يتأخر ساعة.
     const guildId = GUILD_ID || client.guilds.cache.first()?.id;
     if (!guildId) {
       throw new Error('لم ينضم البوت إلى أي سيرفر. أضفه بصلاحية applications.commands ثم أعد التشغيل.');
@@ -143,9 +142,7 @@ client.once('ready', async () => {
   }
 });
 
-// استقبال التفاعلات (أوامر، أزرار، نماذج، قوائم)
 client.on('interactionCreate', async interaction => {
-  // 1. أمر إعداد اللوحة /setup-panel
   if (interaction.isChatInputCommand() && interaction.commandName === 'setup-panel') {
     if (!isAdministrator(interaction)) {
       return interaction.reply({ content: 'عذراً، هذا الأمر مخصص للإدارة فقط.', ephemeral: true });
@@ -167,7 +164,6 @@ client.on('interactionCreate', async interaction => {
     };
     saveConfig(config);
 
-    // بناء أزرار اللوحة
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('btn_personal').setLabel('تعميم شخصي').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('btn_vehicle').setLabel('تعميم لوحة').setStyle(ButtonStyle.Secondary),
@@ -208,7 +204,6 @@ client.on('interactionCreate', async interaction => {
     return interaction.reply({ content: `تم حفظ الاختصار «${name}» بنجاح.`, ephemeral: true });
   }
 
-  // 2. الضغط على الأزرار
   if (interaction.isButton()) {
     if (interaction.customId.startsWith('approve_notice:') || interaction.customId.startsWith('reject_notice:')) {
       if (!isAdministrator(interaction)) {
@@ -300,7 +295,6 @@ client.on('interactionCreate', async interaction => {
     }
   }
 
-  // 3. معالجة النماذج (Modals)
   if (interaction.isModalSubmit()) {
     const config = loadConfig();
     const guildConfig = config[interaction.guildId];
@@ -345,9 +339,7 @@ client.on('interactionCreate', async interaction => {
         try {
           const imageUrl = new URL(imageInput);
           if (imageUrl.protocol === 'http:' || imageUrl.protocol === 'https:') image = imageInput;
-        } catch {
-          // يتم تجاهل رابط الصورة غير الصالح وإكمال إرسال التعميم.
-        }
+        } catch {}
       }
 
       const noticeData = {
@@ -402,7 +394,6 @@ client.on('interactionCreate', async interaction => {
     }
   }
 
-  // 4. معالجة القوائم المنسدلة للبحث
   if (interaction.isStringSelectMenu() && interaction.customId === 'search_type_select') {
     const selected = interaction.values[0];
 
@@ -438,7 +429,6 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// نظام الفحص التلقائي (كل ساعة) للأرشيف
 setInterval(async () => {
   const notices = loadDB();
   const config = loadConfig();
