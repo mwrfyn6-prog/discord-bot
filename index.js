@@ -63,6 +63,9 @@ function buildNoticeEmbed(notice) {
   const embed = new EmbedBuilder()
     .setTitle(notice.type === 'personal' ? 'تعميم شخصي' : 'تعميم لوحة مركبة')
     .setColor(notice.type === 'personal' ? 0xff0000 : 0xffaa00)
+    .setDescription(notice.status === 'pending'
+      ? 'تعميم بانتظار مراجعة الإدارة.'
+      : 'تعميم معتمد ومنشور.')
     .addFields(
       notice.type === 'personal'
         ? { name: 'الاسم', value: notice.name, inline: true }
@@ -75,9 +78,12 @@ function buildNoticeEmbed(notice) {
         : { name: 'السبب', value: notice.reason },
       ...(notice.type === 'personal' ? [{ name: 'السبب', value: notice.reason }] : []),
       { name: 'المُبلغ', value: notice.author }
-    );
+    )
+    .setTimestamp(notice.timestamp ? new Date(notice.timestamp) : new Date())
+    .setFooter({ text: notice.status === 'pending' ? 'بانتظار قبول أو رفض الإدارة' : 'تعميم معتمد' });
 
-  if (notice.image) embed.setImage(notice.image);
+  const imageReference = getNoticeImageReference(notice);
+  if (imageReference) embed.setImage(imageReference);
   return embed;
 }
 
@@ -100,6 +106,17 @@ function normalizeSearchValue(value) {
 
 function isUsableTextChannel(channel) {
   return channel?.isTextBased?.() === true;
+}
+
+function isDiscordImageUrl(imageUrl) {
+  const hostname = new URL(imageUrl).hostname.toLowerCase();
+  return hostname === 'discord.com' || hostname.endsWith('.discord.com') ||
+    hostname === 'discordapp.com' || hostname.endsWith('.discordapp.com') ||
+    hostname === 'discordapp.net' || hostname.endsWith('.discordapp.net');
+}
+
+function getNoticeImageReference(notice) {
+  return notice.image || null;
 }
 
 function isAdministrator(interaction) {
@@ -268,7 +285,9 @@ client.on('interactionCreate', async interaction => {
 
       notice.status = 'approved';
       saveDB(notices);
-      await publicChannel.send({ embeds: [buildNoticeEmbed(notice)] });
+      await publicChannel.send({
+        embeds: [buildNoticeEmbed(notice)]
+      });
       await interaction.update({ content: 'تم قبول التعميم ونشره في الروم العام.', components: [] });
       return;
     }
@@ -361,10 +380,8 @@ client.on('interactionCreate', async interaction => {
       saveDB(notices);
 
       return interaction.reply({
-        content: matches.map(notice => isVehicleSearch
-          ? `**المالك:** ${notice.name}\n**اللوحة:** ${notice.plate}\n**السبب:** ${notice.reason}`
-          : `**الاسم:** ${notice.name} ${notice.family}\n**السبب:** ${notice.reason}`
-        ).join('\n\n'),
+        content: `تم العثور على ${matches.length} تعميم.`,
+        embeds: matches.slice(0, 10).map(notice => buildNoticeEmbed(notice)),
         ephemeral: true
       });
     }
@@ -379,8 +396,12 @@ client.on('interactionCreate', async interaction => {
       if (imageInput) {
         try {
           const imageUrl = new URL(imageInput);
-          if (imageUrl.protocol === 'http:' || imageUrl.protocol === 'https:') image = imageInput;
-        } catch {}
+          if (imageUrl.protocol !== 'http:' && imageUrl.protocol !== 'https:') throw new Error('رابط الصورة غير صالح.');
+          if (isDiscordImageUrl(imageInput)) throw new Error('روابط Discord غير مسموحة. استخدم رابط صورة من موقع آخر.');
+          image = imageInput;
+        } catch (error) {
+          return interaction.reply({ content: `تعذر حفظ الصورة: ${error.message}`, ephemeral: true });
+        }
       }
 
       const noticeData = {
@@ -399,7 +420,7 @@ client.on('interactionCreate', async interaction => {
       const adminChannel = interaction.guild.channels.cache.get(guildConfig.adminId);
       if (adminChannel) {
         await adminChannel.send({
-          content: 'تعميم جديد بانتظار مراجعة الإدارة:',
+          content: '**تعميم شخصي جديد بانتظار المراجعة**\nيرجى مراجعة البيانات والصورة ثم اختيار الإجراء:',
           embeds: [buildNoticeEmbed(noticeData)],
           components: [buildReviewButtons(noticeData.id)]
         });
@@ -429,7 +450,7 @@ client.on('interactionCreate', async interaction => {
       const adminChannel = interaction.guild.channels.cache.get(guildConfig.adminId);
       if (adminChannel) {
         await adminChannel.send({
-          content: 'تعميم جديد بانتظار مراجعة الإدارة:',
+          content: '**تعميم لوحة جديد بانتظار المراجعة**\nيرجى مراجعة البيانات ثم اختيار الإجراء:',
           embeds: [buildNoticeEmbed(noticeData)],
           components: [buildReviewButtons(noticeData.id)]
         });
