@@ -136,19 +136,31 @@ const commands = [
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
+async function registerCommandsForGuild(guildId) {
+  await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
+  console.log(`تم تسجيل أوامر السلاش داخل السيرفر ${guildId}`);
+}
+
 client.once('ready', async () => {
   console.log(`تم تسجيل الدخول بنجاح باسم ${client.user.tag}`);
   try {
-    const guildId = GUILD_ID || client.guilds.cache.first()?.id;
-    if (!guildId) {
+    if (client.guilds.cache.size === 0) {
       throw new Error('لم ينضم البوت إلى أي سيرفر. أضفه بصلاحية applications.commands ثم أعد التشغيل.');
     }
 
-    console.log(`جاري تسجيل أوامر السلاش داخل السيرفر ${guildId}...`);
-    await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
-    console.log('تم تسجيل الأوامر داخل السيرفر بنجاح!');
+    for (const guild of client.guilds.cache.values()) {
+      await registerCommandsForGuild(guild.id);
+    }
   } catch (error) {
     console.error(error);
+  }
+});
+
+client.on('guildCreate', async guild => {
+  try {
+    await registerCommandsForGuild(guild.id);
+  } catch (error) {
+    console.error(`تعذر تسجيل أوامر السلاش داخل السيرفر ${guild.id}:`, error);
   }
 });
 
