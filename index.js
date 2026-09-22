@@ -148,6 +148,8 @@ client.once('ready', async () => {
       throw new Error('لم ينضم البوت إلى أي سيرفر. أضفه بصلاحية applications.commands ثم أعد التشغيل.');
     }
 
+    // إزالة النسخ العالمية القديمة حتى لا تظهر الأوامر مرتين.
+    await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
     for (const guild of client.guilds.cache.values()) {
       await registerCommandsForGuild(guild.id);
     }
