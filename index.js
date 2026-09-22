@@ -16,6 +16,7 @@ const {
 } = require('discord.js');
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
 
 // إعداد سيرفر الويب لضمان التشغيل 24/7
 const app = express();
@@ -34,12 +35,17 @@ const client = new Client({
 });
 
 // ملف تخزين البيانات المحاكي (قاعدة بيانات محلية)
-const DB_FILE = './notices_db.json';
-const CONFIG_FILE = './config_db.json';
+const DB_FILE = path.join(__dirname, 'notices_db.json');
+const CONFIG_FILE = path.join(__dirname, 'config_db.json');
 
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) return [];
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { return []; }
+  try {
+    const notices = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    return Array.isArray(notices)
+      ? notices.map(notice => ({ guildId: GUILD_ID, status: 'approved', ...notice }))
+      : [];
+  } catch (e) { return []; }
 }
 function saveDB(data) {
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
@@ -89,20 +95,24 @@ function buildReviewButtons(noticeId) {
 }
 
 function normalizeSearchValue(value) {
-  return value.trim().replace(/\s+/g, ' ').toLowerCase();
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function isUsableTextChannel(channel) {
+  return channel?.isTextBased?.() === true;
 }
 
 function isAdministrator(interaction) {
   return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) === true;
 }
 
-// قراءة التوكن بأمان من متغيرات البيئة في Render
+// قراءة التوكن من متغيرات البيئة في Render لمنع الأخطاء نهائياً
 const TOKEN = process.env.TOKEN;
-// أيدي السيرفر الخاص بك مثبت هنا بدقة
+// ضع أيدي السيرفر بين علامتي الاقتباس هنا.
 const GUILD_ID = "1339621671480332392";
 
 if (!TOKEN) {
-  throw new Error('متغير TOKEN غير موجود. أضف توكن البوت إلى متغيرات البيئة في موقع Render ثم أعد التشغيل.');
+  throw new Error('متغير TOKEN غير موجود. أضف توكن البوت إلى متغيرات البيئة (Environment) في موقع Render ثم أعد التشغيل.');
 }
 
 const commands = [
@@ -114,7 +124,7 @@ const commands = [
     .addChannelOption(option => 
       option.setName('archive-channel').setDescription('روم الأرشيف التلقائي').setRequired(true))
     .addChannelOption(option =>
-      option.setName('public-channel').setDescription('روم العام لنشر التعميمات المقبولة').setRequired(true)),
+      option.setName('public-channel').setDescription('الروم العام لنشر التعميمات المقبولة').setRequired(true)),
   new SlashCommandBuilder()
     .setName('add-shortcut')
     .setDescription('إضافة اختصار إلى قائمة الاختصارات')
@@ -142,7 +152,9 @@ client.once('ready', async () => {
   }
 });
 
+// استقبال التفاعلات (أوامر، أزرار، نماذج، قوائم)
 client.on('interactionCreate', async interaction => {
+  try {
   if (interaction.isChatInputCommand() && interaction.commandName === 'setup-panel') {
     if (!isAdministrator(interaction)) {
       return interaction.reply({ content: 'عذراً، هذا الأمر مخصص للإدارة فقط.', ephemeral: true });
@@ -151,7 +163,8 @@ client.on('interactionCreate', async interaction => {
     const adminChannel = interaction.options.getChannel('admin-channel');
     const archiveChannel = interaction.options.getChannel('archive-channel');
     const publicChannel = interaction.options.getChannel('public-channel');
-    if (!adminChannel || !archiveChannel || !publicChannel) {
+    if (!adminChannel || !archiveChannel || !publicChannel ||
+      !isUsableTextChannel(adminChannel) || !isUsableTextChannel(archiveChannel) || !isUsableTextChannel(publicChannel)) {
       return interaction.reply({ content: 'حدد روم الإدارة والأرشيف والروم العام كلها ثم أعد المحاولة.', ephemeral: true });
     }
 
@@ -235,6 +248,12 @@ client.on('interactionCreate', async interaction => {
       }
 
       const notice = notices[noticeIndex];
+      if (notice.status === 'approved') {
+        return interaction.reply({ content: 'تمت معالجة هذا التعميم مسبقاً.', ephemeral: true });
+      }
+
+      notice.status = 'approved';
+      saveDB(notices);
       await publicChannel.send({ embeds: [buildNoticeEmbed(notice)] });
       await interaction.update({ content: 'تم قبول التعميم ونشره في الروم العام.', components: [] });
       return;
@@ -304,8 +323,12 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.customId === 'modal_search_vehicle' || interaction.customId === 'modal_search_personal') {
       const searchValue = normalizeSearchValue(interaction.fields.getTextInputValue('search_value'));
+      if (!searchValue) {
+        return interaction.reply({ content: 'اكتب قيمة صحيحة للبحث.', ephemeral: true });
+      }
       const isVehicleSearch = interaction.customId === 'modal_search_vehicle';
       const matches = notices.filter(notice => {
+        if (notice.guildId !== interaction.guildId || (notice.status && notice.status !== 'approved')) return false;
         if (isVehicleSearch && notice.type !== 'vehicle') return false;
         if (!isVehicleSearch && notice.type !== 'personal') return false;
         const value = isVehicleSearch ? notice.plate : notice.name;
@@ -318,6 +341,10 @@ client.on('interactionCreate', async interaction => {
           ephemeral: true
         });
       }
+
+      const searchedAt = Date.now();
+      matches.forEach(notice => { notice.lastSearched = searchedAt; });
+      saveDB(notices);
 
       return interaction.reply({
         content: matches.map(notice => isVehicleSearch
@@ -344,6 +371,8 @@ client.on('interactionCreate', async interaction => {
 
       const noticeData = {
         id: Date.now().toString(),
+        guildId: interaction.guildId,
+        status: 'pending',
         type: 'personal',
         author: interaction.user.tag,
         name, traits, family, reason, image,
@@ -372,6 +401,8 @@ client.on('interactionCreate', async interaction => {
 
       const noticeData = {
         id: Date.now().toString(),
+        guildId: interaction.guildId,
+        status: 'pending',
         type: 'vehicle',
         author: interaction.user.tag,
         name, plate, reason,
@@ -427,6 +458,12 @@ client.on('interactionCreate', async interaction => {
 
     return interaction.update({ content: shortcut.text, components: [] });
   }
+  } catch (error) {
+    console.error('حدث خطأ أثناء معالجة التفاعل:', error);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'حدث خطأ غير متوقع. حاول مرة أخرى لاحقاً.', ephemeral: true }).catch(() => {});
+    }
+  }
 });
 
 setInterval(async () => {
@@ -439,11 +476,15 @@ setInterval(async () => {
   for (let notice of notices) {
     if (now - (notice.lastSearched || notice.timestamp) > ONE_WEEK) {
       for (const guildId in config) {
+        if (notice.guildId !== guildId) continue;
         const guild = client.guilds.cache.get(guildId);
         if (guild) {
           const archiveChannel = guild.channels.cache.get(config[guildId].archiveId);
-          if (archiveChannel) {
-            archiveChannel.send(`[أرشيف تلقائي] انتهت صلاحية التعميم الخاص بـ: ${notice.name || notice.plate}`);
+          if (isUsableTextChannel(archiveChannel)) {
+            archiveChannel.send({
+              content: `[أرشيف تلقائي] انتهت صلاحية التعميم الخاص بـ: ${notice.name || notice.plate}`,
+              embeds: [buildNoticeEmbed(notice)]
+            }).catch(error => console.error('تعذر إرسال التعميم إلى الأرشيف:', error));
           }
         }
       }
