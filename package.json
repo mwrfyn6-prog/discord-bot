@@ -12,6 +12,8 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.0",
+    "cloudinary": "^2.11.0",
     "discord.js": "^14.27.0",
     "express": "^5.2.1"
   }
