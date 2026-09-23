@@ -17,6 +17,8 @@ const {
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
+const { v2: cloudinary } = require('cloudinary');
 
 // إعداد سيرفر الويب لضمان التشغيل 24/7
 const app = express();
@@ -34,29 +36,139 @@ const client = new Client({
   ]
 });
 
-// ملف تخزين البيانات المحاكي (قاعدة بيانات محلية)
+// ملفات البيانات القديمة تُستخدم فقط كنسخة احتياطية/ترحيل، والتخزين الأساسي في Supabase.
 const DB_FILE = path.join(__dirname, 'notices_db.json');
 const CONFIG_FILE = path.join(__dirname, 'config_db.json');
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !process.env.CLOUDINARY_CLOUD_NAME ||
+  !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+  throw new Error('متغيرات Supabase وCloudinary غير مكتملة في Environment Variables.');
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+let noticesCache = [];
+let configCache = {};
 
 function loadDB() {
-  if (!fs.existsSync(DB_FILE)) return [];
-  try {
-    const notices = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    return Array.isArray(notices)
-      ? notices.map(notice => ({ guildId: GUILD_ID, status: 'approved', ...notice }))
-      : [];
-  } catch (e) { return []; }
+  return noticesCache;
 }
-function saveDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+async function saveDB(data) {
+  noticesCache = data;
+  const rows = data.map(notice => ({
+    id: notice.id,
+    guild_id: notice.guildId,
+    status: notice.status || 'pending',
+    type: notice.type,
+    author: notice.author,
+    name: notice.name,
+    family: notice.family || null,
+    traits: notice.traits || null,
+    plate: notice.plate || null,
+    reason: notice.reason,
+    image_url: notice.image || null,
+    created_at: new Date(notice.timestamp || Date.now()).toISOString(),
+    last_searched_at: new Date(notice.lastSearched || notice.timestamp || Date.now()).toISOString(),
+    archived_at: notice.archivedAt ? new Date(notice.archivedAt).toISOString() : null
+  }));
+  const { error: deleteError } = await supabase.from('notices').delete().neq('id', '');
+  if (deleteError) throw deleteError;
+  if (rows.length) {
+    const { error } = await supabase.from('notices').insert(rows);
+    if (error) throw error;
+  }
 }
 
 function loadConfig() {
-  if (!fs.existsSync(CONFIG_FILE)) return {};
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) { return {}; }
+  return configCache;
 }
-function saveConfig(data) {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(data, null, 2));
+async function saveConfig(data) {
+  configCache = data;
+  const rows = Object.entries(data).map(([guildId, config]) => ({
+    guild_id: guildId,
+    admin_id: config.adminId || null,
+    archive_id: config.archiveId || null,
+    public_id: config.publicId || null,
+    shortcuts: config.shortcuts || []
+  }));
+  const { error: deleteError } = await supabase.from('guild_configs').delete().neq('guild_id', '');
+  if (deleteError) throw deleteError;
+  if (rows.length) {
+    const { error } = await supabase.from('guild_configs').insert(rows);
+    if (error) throw error;
+  }
+}
+
+async function initializeStorage() {
+  const [{ data: noticeRows, error: noticesError }, { data: configRows, error: configError }] = await Promise.all([
+    supabase.from('notices').select('*'),
+    supabase.from('guild_configs').select('*')
+  ]);
+  if (noticesError) throw noticesError;
+  if (configError) throw configError;
+
+  noticesCache = (noticeRows || []).map(row => ({
+    id: row.id,
+    guildId: row.guild_id,
+    status: row.status,
+    type: row.type,
+    author: row.author,
+    name: row.name,
+    family: row.family,
+    traits: row.traits,
+    plate: row.plate,
+    reason: row.reason,
+    image: row.image_url,
+    timestamp: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+    lastSearched: row.last_searched_at ? new Date(row.last_searched_at).getTime() : Date.now(),
+    archivedAt: row.archived_at ? new Date(row.archived_at).getTime() : null
+  }));
+  configCache = Object.fromEntries((configRows || []).map(row => [row.guild_id, {
+    adminId: row.admin_id,
+    archiveId: row.archive_id,
+    publicId: row.public_id,
+    shortcuts: row.shortcuts || []
+  }]));
+
+  if (!noticeRows?.length && fs.existsSync(DB_FILE)) {
+    try {
+      const legacyNotices = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+      noticesCache = Array.isArray(legacyNotices)
+        ? legacyNotices.map(notice => ({
+          ...notice,
+          guildId: notice.guildId || GUILD_ID,
+          status: notice.status || 'approved'
+        }))
+        : [];
+      if (noticesCache.length) await saveDB(noticesCache);
+    } catch (error) {
+      console.error('تعذر ترحيل التعميمات القديمة:', error);
+    }
+  }
+
+  if (!configRows?.length && fs.existsSync(CONFIG_FILE)) {
+    try {
+      const legacyConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+      if (legacyConfig && typeof legacyConfig === 'object') await saveConfig(legacyConfig);
+    } catch (error) {
+      console.error('تعذر ترحيل الإعدادات القديمة:', error);
+    }
+  }
+}
+
+async function uploadImage(imageUrl) {
+  const result = await cloudinary.uploader.upload(imageUrl, {
+    folder: 't3mem/notices',
+    resource_type: 'image'
+  });
+  return result.secure_url;
 }
 
 function buildNoticeEmbed(notice) {
@@ -161,6 +273,7 @@ async function registerCommandsForGuild(guildId) {
 client.once('ready', async () => {
   console.log(`تم تسجيل الدخول بنجاح باسم ${client.user.tag}`);
   try {
+    await initializeStorage();
     if (client.guilds.cache.size === 0) {
       throw new Error('لم ينضم البوت إلى أي سيرفر. أضفه بصلاحية applications.commands ثم أعد التشغيل.');
     }
@@ -206,7 +319,7 @@ client.on('interactionCreate', async interaction => {
       publicId: publicChannel.id,
       shortcuts: config[interaction.guildId]?.shortcuts || []
     };
-    saveConfig(config);
+    await saveConfig(config);
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('btn_personal').setLabel('تعميم شخصي').setStyle(ButtonStyle.Primary),
@@ -244,7 +357,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     config[interaction.guildId] = { ...guildConfig, shortcuts };
-    saveConfig(config);
+    await saveConfig(config);
     return interaction.reply({ content: `تم حفظ الاختصار «${name}» بنجاح.`, ephemeral: true });
   }
 
@@ -263,7 +376,7 @@ client.on('interactionCreate', async interaction => {
 
       if (action === 'reject_notice') {
         notices.splice(noticeIndex, 1);
-        saveDB(notices);
+        await saveDB(notices);
         await interaction.deferReply({ ephemeral: true });
         await interaction.message.delete();
         return interaction.editReply('تم رفض التعميم وحذفه.');
@@ -284,7 +397,7 @@ client.on('interactionCreate', async interaction => {
       }
 
       notice.status = 'approved';
-      saveDB(notices);
+      await saveDB(notices);
       await publicChannel.send({
         embeds: [buildNoticeEmbed(notice)]
       });
@@ -377,7 +490,7 @@ client.on('interactionCreate', async interaction => {
 
       const searchedAt = Date.now();
       matches.forEach(notice => { notice.lastSearched = searchedAt; });
-      saveDB(notices);
+      await saveDB(notices);
 
       return interaction.reply({
         content: `تم العثور على ${matches.length} تعميم.`,
@@ -398,7 +511,7 @@ client.on('interactionCreate', async interaction => {
           const imageUrl = new URL(imageInput);
           if (imageUrl.protocol !== 'http:' && imageUrl.protocol !== 'https:') throw new Error('رابط الصورة غير صالح.');
           if (isDiscordImageUrl(imageInput)) throw new Error('روابط Discord غير مسموحة. استخدم رابط صورة من موقع آخر.');
-          image = imageInput;
+          image = await uploadImage(imageInput);
         } catch (error) {
           return interaction.reply({ content: `تعذر حفظ الصورة: ${error.message}`, ephemeral: true });
         }
@@ -415,7 +528,7 @@ client.on('interactionCreate', async interaction => {
         lastSearched: Date.now()
       };
       notices.push(noticeData);
-      saveDB(notices);
+      await saveDB(notices);
 
       const adminChannel = interaction.guild.channels.cache.get(guildConfig.adminId);
       if (adminChannel) {
@@ -445,7 +558,7 @@ client.on('interactionCreate', async interaction => {
         lastSearched: Date.now()
       };
       notices.push(noticeData);
-      saveDB(notices);
+      await saveDB(notices);
 
       const adminChannel = interaction.guild.channels.cache.get(guildConfig.adminId);
       if (adminChannel) {
@@ -509,25 +622,30 @@ setInterval(async () => {
 
   let updatedNotices = [];
   for (let notice of notices) {
-    if (now - (notice.lastSearched || notice.timestamp) > ONE_WEEK) {
+    if (notice.status === 'approved' && !notice.archivedAt &&
+      now - (notice.lastSearched || notice.timestamp) > ONE_WEEK) {
       for (const guildId in config) {
         if (notice.guildId !== guildId) continue;
         const guild = client.guilds.cache.get(guildId);
         if (guild) {
           const archiveChannel = guild.channels.cache.get(config[guildId].archiveId);
           if (isUsableTextChannel(archiveChannel)) {
-            archiveChannel.send({
-              content: `[أرشيف تلقائي] انتهت صلاحية التعميم الخاص بـ: ${notice.name || notice.plate}`,
-              embeds: [buildNoticeEmbed(notice)]
-            }).catch(error => console.error('تعذر إرسال التعميم إلى الأرشيف:', error));
+            try {
+              await archiveChannel.send({
+                content: `[أرشيف تلقائي] تم نقل التعميم إلى الأرشيف: ${notice.name || notice.plate}`,
+                embeds: [buildNoticeEmbed(notice)]
+              });
+              notice.archivedAt = now;
+            } catch (error) {
+              console.error('تعذر إرسال التعميم إلى الأرشيف:', error);
+            }
           }
         }
       }
-    } else {
-      updatedNotices.push(notice);
     }
+    updatedNotices.push(notice);
   }
-  saveDB(updatedNotices);
+  await saveDB(updatedNotices);
 }, 60 * 60 * 1000);
 
 client.login(TOKEN);
