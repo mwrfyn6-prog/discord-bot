@@ -73,6 +73,7 @@ async function saveDB(data) {
     traits: notice.traits || null,
     plate: notice.plate || null,
     reason: notice.reason,
+    discord_id: notice.discordId || null,
     image_url: notice.image || null,
     created_at: new Date(notice.timestamp || Date.now()).toISOString(),
     last_searched_at: new Date(notice.lastSearched || notice.timestamp || Date.now()).toISOString(),
@@ -125,6 +126,7 @@ async function initializeStorage() {
     traits: row.traits,
     plate: row.plate,
     reason: row.reason,
+    discordId: row.discord_id,
     image: row.image_url,
     timestamp: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
     lastSearched: row.last_searched_at ? new Date(row.last_searched_at).getTime() : Date.now(),
@@ -189,6 +191,7 @@ function buildNoticeEmbed(notice) {
         ? { name: 'الصفات الجسدية', value: notice.traits }
         : { name: 'السبب', value: notice.reason },
       ...(notice.type === 'personal' ? [{ name: 'السبب', value: notice.reason }] : []),
+      ...(notice.discordId ? [{ name: 'أيدي Discord', value: `<@${notice.discordId}>`, inline: true }] : []),
       { name: 'المُبلغ', value: notice.author }
     )
     .setTimestamp(notice.timestamp ? new Date(notice.timestamp) : new Date())
@@ -229,6 +232,16 @@ function isDiscordImageUrl(imageUrl) {
 
 function getNoticeImageReference(notice) {
   return notice.image || null;
+}
+
+function parsePersonalExtras(value) {
+  const parts = String(value || '').split('|').map(part => part.trim()).filter(Boolean);
+  const discordId = parts.find(part => /^\d{17,20}$/.test(part)) || '';
+  const image = parts.find(part => {
+    if (!/^https?:\/\//i.test(part)) return false;
+    try { return !isDiscordImageUrl(part); } catch { return false; }
+  }) || '';
+  return { discordId, image };
 }
 
 function isAdministrator(interaction) {
@@ -412,7 +425,7 @@ client.on('interactionCreate', async interaction => {
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_traits').setLabel('الصفات الجسدية').setStyle(TextInputStyle.Paragraph).setRequired(true)),
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_family').setLabel('اسم العائلة').setStyle(TextInputStyle.Short).setRequired(true)),
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_reason').setLabel('السبب').setStyle(TextInputStyle.Paragraph).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_image').setLabel('رابط الصورة (اختياري)').setStyle(TextInputStyle.Short).setRequired(false))
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('p_extras').setLabel('الصورة | أيدي Discord (اختياري)').setPlaceholder('الرابط | 123456789012345678').setStyle(TextInputStyle.Short).setRequired(false))
       );
       return await interaction.showModal(modal);
     }
@@ -422,7 +435,9 @@ client.on('interactionCreate', async interaction => {
       modal.addComponents(
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('v_name').setLabel('اسم المالك').setStyle(TextInputStyle.Short).setRequired(true)),
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('v_plate').setLabel('رقم اللوحة').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('v_reason').setLabel('السبب').setStyle(TextInputStyle.Paragraph).setRequired(true))
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('v_reason').setLabel('السبب').setStyle(TextInputStyle.Paragraph).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('v_discord_id').setLabel('أيدي Discord (اختياري)').setStyle(TextInputStyle.Short).setRequired(false)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('v_image').setLabel('رابط الصورة (اختياري)').setStyle(TextInputStyle.Short).setRequired(false))
       );
       return await interaction.showModal(modal);
     }
@@ -434,7 +449,8 @@ client.on('interactionCreate', async interaction => {
           .setPlaceholder('اختر نوع البحث المطلوب')
           .addOptions([
             { label: 'البحث في التعميمات الشخصية', value: 'search_personal' },
-            { label: 'البحث في تعميمات اللوحات', value: 'search_vehicle' }
+            { label: 'البحث في تعميمات اللوحات', value: 'search_vehicle' },
+            { label: 'البحث بأيدي Discord', value: 'search_discord_id' }
           ])
       );
       return await interaction.reply({ content: 'الرجاء تحديد نوع البحث:', components: [selectRow], ephemeral: true });
@@ -467,23 +483,26 @@ client.on('interactionCreate', async interaction => {
 
     const notices = loadDB();
 
-    if (interaction.customId === 'modal_search_vehicle' || interaction.customId === 'modal_search_personal') {
+    if (interaction.customId === 'modal_search_vehicle' || interaction.customId === 'modal_search_personal' || interaction.customId === 'modal_search_discord_id') {
       const searchValue = normalizeSearchValue(interaction.fields.getTextInputValue('search_value'));
       if (!searchValue) {
         return interaction.reply({ content: 'اكتب قيمة صحيحة للبحث.', ephemeral: true });
       }
       const isVehicleSearch = interaction.customId === 'modal_search_vehicle';
+      const isDiscordIdSearch = interaction.customId === 'modal_search_discord_id';
       const matches = notices.filter(notice => {
         if (notice.guildId !== interaction.guildId || (notice.status && notice.status !== 'approved')) return false;
-        if (isVehicleSearch && notice.type !== 'vehicle') return false;
-        if (!isVehicleSearch && notice.type !== 'personal') return false;
-        const value = isVehicleSearch ? notice.plate : notice.name;
+        if (!isDiscordIdSearch && isVehicleSearch && notice.type !== 'vehicle') return false;
+        if (!isDiscordIdSearch && !isVehicleSearch && notice.type !== 'personal') return false;
+        const value = isDiscordIdSearch ? notice.discordId : (isVehicleSearch ? notice.plate : notice.name);
         return normalizeSearchValue(value).includes(searchValue);
       });
 
       if (matches.length === 0) {
         return interaction.reply({
-          content: isVehicleSearch ? 'لا يوجد تعميم على رقم اللوحة هذا.' : 'لا يوجد تعميم على الاسم هذا.',
+          content: isDiscordIdSearch
+            ? 'لا يوجد تعميم مرتبط بأيدي Discord هذا.'
+            : (isVehicleSearch ? 'لا يوجد تعميم على رقم اللوحة هذا.' : 'لا يوجد تعميم على الاسم هذا.'),
           ephemeral: true
         });
       }
@@ -504,7 +523,12 @@ client.on('interactionCreate', async interaction => {
       const traits = interaction.fields.getTextInputValue('p_traits');
       const family = interaction.fields.getTextInputValue('p_family');
       const reason = interaction.fields.getTextInputValue('p_reason');
-      const imageInput = interaction.fields.getTextInputValue('p_image').trim();
+      const extras = parsePersonalExtras(interaction.fields.getTextInputValue('p_extras'));
+      const discordId = extras.discordId;
+      const imageInput = extras.image;
+      if (discordId && !/^\d{17,20}$/.test(discordId)) {
+        return interaction.reply({ content: 'أيدي Discord غير صالح. أدخل الأيدي الرقمي فقط.', ephemeral: true });
+      }
       let image = null;
       if (imageInput) {
         try {
@@ -523,7 +547,7 @@ client.on('interactionCreate', async interaction => {
         status: 'pending',
         type: 'personal',
         author: interaction.user.tag,
-        name, traits, family, reason, image,
+        name, traits, family, reason, discordId, image,
         timestamp: Date.now(),
         lastSearched: Date.now()
       };
@@ -546,6 +570,22 @@ client.on('interactionCreate', async interaction => {
       const name = interaction.fields.getTextInputValue('v_name');
       const plate = interaction.fields.getTextInputValue('v_plate');
       const reason = interaction.fields.getTextInputValue('v_reason');
+      const discordId = interaction.fields.getTextInputValue('v_discord_id').trim();
+      const imageInput = interaction.fields.getTextInputValue('v_image').trim();
+      if (discordId && !/^\d{17,20}$/.test(discordId)) {
+        return interaction.reply({ content: 'أيدي Discord غير صالح. أدخل الأيدي الرقمي فقط.', ephemeral: true });
+      }
+      let image = null;
+      if (imageInput) {
+        try {
+          const imageUrl = new URL(imageInput);
+          if (imageUrl.protocol !== 'http:' && imageUrl.protocol !== 'https:') throw new Error('رابط الصورة غير صالح.');
+          if (isDiscordImageUrl(imageInput)) throw new Error('روابط Discord غير مسموحة. استخدم رابط صورة من موقع آخر.');
+          image = await uploadImage(imageInput);
+        } catch (error) {
+          return interaction.reply({ content: `تعذر حفظ الصورة: ${error.message}`, ephemeral: true });
+        }
+      }
 
       const noticeData = {
         id: Date.now().toString(),
@@ -553,7 +593,7 @@ client.on('interactionCreate', async interaction => {
         status: 'pending',
         type: 'vehicle',
         author: interaction.user.tag,
-        name, plate, reason,
+        name, plate, reason, discordId, image,
         timestamp: Date.now(),
         lastSearched: Date.now()
       };
@@ -591,6 +631,16 @@ client.on('interactionCreate', async interaction => {
       modal.addComponents(
         new ActionRowBuilder().addComponents(
           new TextInputBuilder().setCustomId('search_value').setLabel('اكتب رقم اللوحة').setStyle(TextInputStyle.Short).setRequired(true)
+        )
+      );
+      return await interaction.showModal(modal);
+    }
+
+    if (selected === 'search_discord_id') {
+      const modal = new ModalBuilder().setCustomId('modal_search_discord_id').setTitle('البحث بأيدي Discord');
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('search_value').setLabel('اكتب أيدي Discord').setStyle(TextInputStyle.Short).setRequired(true)
         )
       );
       return await interaction.showModal(modal);
