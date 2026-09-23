@@ -284,8 +284,16 @@ const commands = [
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 async function registerCommandsForGuild(guildId) {
+  await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: [] });
   await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
   console.log(`تم تسجيل أوامر السلاش داخل السيرفر ${guildId}`);
+}
+
+async function removeGlobalCommands() {
+  const globalCommands = await rest.get(Routes.applicationCommands(client.user.id));
+  for (const command of globalCommands) {
+    await rest.delete(Routes.applicationCommand(client.user.id, command.id));
+  }
 }
 
 client.once('ready', async () => {
@@ -296,8 +304,8 @@ client.once('ready', async () => {
       throw new Error('لم ينضم البوت إلى أي سيرفر. أضفه بصلاحية applications.commands ثم أعد التشغيل.');
     }
 
-    // إزالة النسخ العالمية القديمة حتى لا تظهر الأوامر مرتين.
-    await rest.put(Routes.applicationCommands(client.user.id), { body: [] });
+    // إزالة الأوامر العالمية القديمة حتى لا تظهر مع أوامر السيرفر مرتين.
+    await removeGlobalCommands();
     for (const guild of client.guilds.cache.values()) {
       await registerCommandsForGuild(guild.id);
     }
