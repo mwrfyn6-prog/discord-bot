@@ -273,7 +273,12 @@ const commands = [
     .addStringOption(option =>
       option.setName('name').setDescription('اسم الاختصار الظاهر في القائمة').setRequired(true).setMaxLength(100))
     .addStringOption(option =>
-      option.setName('text').setDescription('النص الجاهز للاختصار').setRequired(true).setMaxLength(1500))
+      option.setName('text').setDescription('النص الجاهز للاختصار').setRequired(true).setMaxLength(1500)),
+  new SlashCommandBuilder()
+    .setName('remove-shortcut')
+    .setDescription('حذف اختصار من القائمة')
+    .addStringOption(option =>
+      option.setName('name').setDescription('اسم الاختصار المراد حذفه').setRequired(true).setMaxLength(100))
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -372,6 +377,29 @@ client.on('interactionCreate', async interaction => {
     config[interaction.guildId] = { ...guildConfig, shortcuts };
     await saveConfig(config);
     return interaction.reply({ content: `تم حفظ الاختصار «${name}» بنجاح.`, ephemeral: true });
+  }
+
+  if (interaction.isChatInputCommand() && interaction.commandName === 'remove-shortcut') {
+    if (!isAdministrator(interaction)) {
+      return interaction.reply({ content: 'عذراً، هذا الأمر مخصص للإدارة فقط.', ephemeral: true });
+    }
+
+    const name = interaction.options.getString('name', true).trim();
+    const config = loadConfig();
+    const guildConfig = config[interaction.guildId] || {};
+    const shortcuts = guildConfig.shortcuts || [];
+    const shortcutIndex = shortcuts.findIndex(shortcut =>
+      normalizeSearchValue(shortcut.name) === normalizeSearchValue(name)
+    );
+
+    if (shortcutIndex === -1) {
+      return interaction.reply({ content: `لم يتم العثور على الاختصار «${name}».`, ephemeral: true });
+    }
+
+    shortcuts.splice(shortcutIndex, 1);
+    config[interaction.guildId] = { ...guildConfig, shortcuts };
+    await saveConfig(config);
+    return interaction.reply({ content: `تم حذف الاختصار «${name}» بنجاح.`, ephemeral: true });
   }
 
   if (interaction.isButton()) {
