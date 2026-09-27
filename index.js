@@ -12,13 +12,15 @@ const {
   TextInputStyle, 
   EmbedBuilder, 
   StringSelectMenuBuilder, 
-  PermissionFlagsBits 
+  PermissionFlagsBits,
+  PermissionsBitField
 } = require('discord.js');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { v2: cloudinary } = require('cloudinary');
+require('dotenv').config();
 
 // إعداد سيرفر الويب لضمان التشغيل 24/7
 const app = express();
@@ -249,12 +251,209 @@ function isAdministrator(interaction) {
 }
 
 // قراءة التوكن من متغيرات البيئة في Render لمنع الأخطاء نهائياً
-const TOKEN = process.env.TOKEN;
-// ضع أيدي السيرفر بين علامتي الاقتباس هنا.
-const GUILD_ID = "1339621671480332392";
+const TOKEN = process.env.TOKEN || process.env.DISCORD_TOKEN;
+const GUILD_ID = process.env.GUILD_ID || "1339621671480332392";
+const LEVEL_CONFIG_FILE = path.join(__dirname, 'leveling_config.json');
+const LEVEL_PROGRESS_FILE = path.join(__dirname, 'leveling_db.json');
+const MAX_LEVEL = 1000;
+const voiceTracking = new Map();
+const LEVEL_NAMES = [
+  'مبتدئ', 'مغامر', 'محترف', 'مميز', 'قائد', 'استثنائي', 'أسطوري',
+  'النبيل', 'الشرس', 'المرموق', 'الملهم', 'الأسطورة', 'الفرعون', 'الذئب', 'الملك',
+  'السيد', 'العملاق', 'القاتل', 'المدافع', 'القائد الأعلى'
+];
+
+function readJsonFile(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const content = fs.readFileSync(filePath, 'utf8');
+    return content ? JSON.parse(content) : fallback;
+  } catch (error) {
+    console.error(`تعذر قراءة ملف ${filePath}:`, error);
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+function loadLevelConfig() {
+  return readJsonFile(LEVEL_CONFIG_FILE, {});
+}
+
+function saveLevelConfig(data) {
+  writeJsonFile(LEVEL_CONFIG_FILE, data);
+}
+
+function loadLevelProgress() {
+  return readJsonFile(LEVEL_PROGRESS_FILE, {});
+}
+
+function saveLevelProgress(data) {
+  writeJsonFile(LEVEL_PROGRESS_FILE, data);
+}
+
+function getLevelThreshold(level) {
+  if (level <= 1) return 0;
+  const band = Math.min(Math.floor((level - 1) / 50), 19);
+  const relative = (level - 1) % 50;
+  const bandBase = [
+    0, 1300, 8500, 31000, 96000, 250000, 520000, 1010000,
+    1810000, 2930000, 4500000, 6700000, 9600000, 13400000,
+    18200000, 24400000, 32200000, 42000000, 55000000, 72000000
+  ];
+  const base = bandBase[band] || bandBase[bandBase.length - 1];
+  const difficultyStep = 70 + band * 180 + relative * (15 + band * 6);
+  return Math.round(base + relative * difficultyStep + Math.pow(relative, 2) * (10 + band * 16));
+}
+
+function getLevelFromXp(xp) {
+  let level = 1;
+  while (level < MAX_LEVEL && xp >= getLevelThreshold(level + 1)) {
+    level += 1;
+  }
+  return level;
+}
+
+function getLevelName(level) {
+  const index = Math.min(Math.floor((level - 1) / 50), LEVEL_NAMES.length - 1);
+  return LEVEL_NAMES[index] || 'الأسطورة';
+}
+
+function getProgressBar(currentXP, currentLevel) {
+  const nextLevel = currentLevel + 1;
+  const currentNeed = currentXP - getLevelThreshold(currentLevel);
+  const nextNeed = getLevelThreshold(nextLevel) - getLevelThreshold(currentLevel);
+  const progress = nextNeed <= 0 ? 1 : Math.max(0, Math.min(1, currentNeed / nextNeed));
+  const filled = Math.round(progress * 12);
+  return `${'█'.repeat(filled)}${'░'.repeat(12 - filled)}`;
+}
+
+function getLevelProgressValue(level) {
+  const xp = getLevelThreshold(level);
+  return xp > 0 ? `${xp.toLocaleString('en-US')} XP` : '0 XP';
+}
+
+function ensureGuildProgress(guildId) {
+  const data = loadLevelProgress();
+  if (!data[guildId]) data[guildId] = {};
+  saveLevelProgress(data);
+  return data[guildId];
+}
+
+function ensureUserProgress(guildId, userId) {
+  const guildData = ensureGuildProgress(guildId);
+  if (!guildData[userId]) {
+    guildData[userId] = {
+      userId,
+      messages: 0,
+      voiceMinutes: 0,
+      xp: 0,
+      level: 0
+    };
+    saveLevelProgress(loadLevelProgress());
+  }
+  return guildData[userId];
+}
+
+function syncUserLevel(entry) {
+  entry.level = Math.min(MAX_LEVEL, getLevelFromXp(Number(entry.xp || 0)));
+  return entry;
+}
+
+async function announceLevelUp(guildId, userId, previousLevel, newLevel, xpValue) {
+  const config = loadLevelConfig();
+  const guildConfig = config[guildId];
+  if (!guildConfig?.announceChannelId) return;
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return;
+
+  const channel = guild.channels.cache.get(guildConfig.announceChannelId);
+  if (!channel || !isUsableTextChannel(channel)) return;
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  const mention = member ? `<@${userId}>` : `<@${userId}>`;
+  const levelName = getLevelName(newLevel);
+  const nextThreshold = getLevelThreshold(newLevel + 1);
+  const nextText = nextThreshold > 0 ? `الفل التالي: ${nextThreshold.toLocaleString('en-US')} XP` : 'هذا هو أعلى فل';
+
+  await channel.send({
+    content: `🎉 ${mention} ارتقى إلى فل ${newLevel} (${levelName})\n✨ XP الحالي: ${xpValue.toLocaleString('en-US')}\n📈 ${nextText}`
+  });
+}
+
+async function refreshLevelBoardForGuild(guildId) {
+  const config = loadLevelConfig();
+  const guildConfig = config[guildId];
+  if (!guildConfig?.boardChannelId) return;
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return;
+
+  const boardChannel = guild.channels.cache.get(guildConfig.boardChannelId);
+  if (!boardChannel || !isUsableTextChannel(boardChannel)) return;
+
+  const allProgress = loadLevelProgress()[guildId] || {};
+  const list = Object.values(allProgress)
+    .map(entry => ({
+      userId: entry.userId,
+      messages: Number(entry.messages || 0),
+      voiceMinutes: Number(entry.voiceMinutes || 0),
+      xp: Number(entry.xp || 0),
+      level: Number(entry.level || getLevelFromXp(Number(entry.xp || 0)))
+    }))
+    .filter(entry => entry.userId);
+
+  const topMessages = [...list].sort((a, b) => b.messages - a.messages).slice(0, 8);
+  const topVoice = [...list].sort((a, b) => b.voiceMinutes - a.voiceMinutes).slice(0, 8);
+  const topXp = [...list].sort((a, b) => b.xp - a.xp).slice(0, 8);
+
+  const formatRank = (items, suffix) => items.length
+    ? items.map((item, index) => `${index + 1}. <@${item.userId}> • ${suffix}: ${item[suffix]}`).join('\n')
+    : 'لا يوجد بيانات بعد.';
+
+  const embed = new EmbedBuilder()
+    .setTitle('📊 لوحة النشاط والفل | LEVEL BOARD')
+    .setDescription('أفضل الأعضاء حسب الرسائل، الوقت الصوتي، والمستوى العام. التحديث التلقائي كل ساعة.')
+    .setColor(0x00d1b2)
+    .addFields(
+      { name: '🏆 أعلى 8 رسائل', value: formatRank(topMessages, 'messages'), inline: false },
+      { name: '🔊 أعلى 8 صوت', value: formatRank(topVoice, 'voiceMinutes'), inline: false },
+      { name: '✨ أعلى 8 XP', value: topXp.map((item, index) => `${index + 1}. <@${item.userId}> • XP ${item.xp.toLocaleString('en-US')} • فل ${item.level} • ${getLevelName(item.level)}`).join('\n') || 'لا يوجد بيانات بعد.', inline: false },
+      { name: '🔒 الحد الأقصى', value: `الفل الأعلى هو ${MAX_LEVEL} • كل 50 فل تصبح الترقية أصعب بكثير.` }
+    )
+    .setFooter({ text: `آخر تحديث: ${new Date().toLocaleString('ar-SA')}` })
+    .setTimestamp(new Date());
+
+  try {
+    if (guildConfig.messageId) {
+      const oldMessage = await boardChannel.messages.fetch(guildConfig.messageId).catch(() => null);
+      if (oldMessage) {
+        await oldMessage.edit({ embeds: [embed] });
+        return;
+      }
+    }
+
+    const sent = await boardChannel.send({ embeds: [embed] });
+    guildConfig.messageId = sent.id;
+    config[guildId] = guildConfig;
+    saveLevelConfig(config);
+  } catch (error) {
+    console.error(`تعذر تحديث لوحة النشاط في السيرفر ${guildId}:`, error);
+  }
+}
+
+async function refreshAllLevelBoards() {
+  const config = loadLevelConfig();
+  for (const guildId of Object.keys(config)) {
+    await refreshLevelBoardForGuild(guildId);
+  }
+}
 
 if (!TOKEN) {
-  throw new Error('متغير TOKEN غير موجود. أضف توكن البوت إلى متغيرات البيئة (Environment) في موقع Render ثم أعد التشغيل.');
+  throw new Error('متغير TOKEN/DISCORD_TOKEN غير موجود. أضف توكن البوت إلى متغيرات البيئة (Environment) في موقع Render ثم أعد التشغيل.');
 }
 
 const commands = [
@@ -278,7 +477,17 @@ const commands = [
     .setName('remove-shortcut')
     .setDescription('حذف اختصار من القائمة')
     .addStringOption(option =>
-      option.setName('name').setDescription('اسم الاختصار المراد حذفه').setRequired(true).setMaxLength(100))
+      option.setName('name').setDescription('اسم الاختصار المراد حذفه').setRequired(true).setMaxLength(100)),
+  new SlashCommandBuilder()
+    .setName('setup-levels')
+    .setDescription('إعداد لوحة النشاط والفل حتى المستوى 1000')
+    .addChannelOption(option =>
+      option.setName('board-channel').setDescription('الروم الذي ستظهر فيه لوحة المتصدرين').setRequired(true))
+    .addChannelOption(option =>
+      option.setName('announce-channel').setDescription('الروم الذي يرسل فيه تنبيهات الترقية').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('rank')
+    .setDescription('عرض مستوى اللاعب وXP الخاص بك')
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -319,6 +528,88 @@ client.on('guildCreate', async guild => {
     await registerCommandsForGuild(guild.id);
   } catch (error) {
     console.error(`تعذر تسجيل أوامر السلاش داخل السيرفر ${guild.id}:`, error);
+  }
+});
+
+client.on('messageCreate', async message => {
+  try {
+    if (message.author.bot || !message.guild) return;
+
+    const data = loadLevelProgress();
+    const guildData = data[message.guild.id] || {};
+    const progress = guildData[message.author.id] || {
+      userId: message.author.id,
+      messages: 0,
+      voiceMinutes: 0,
+      xp: 0,
+      level: 0
+    };
+
+    const previousLevel = getLevelFromXp(Number(progress.xp || 0));
+    progress.messages = Number(progress.messages || 0) + 1;
+    const earnedMessageXp = 12 + Math.min(35, Math.floor((message.content || '').length / 18));
+    progress.xp = Number(progress.xp || 0) + earnedMessageXp;
+    progress.xp = Math.min(progress.xp, Number.MAX_SAFE_INTEGER);
+    syncUserLevel(progress);
+    guildData[message.author.id] = progress;
+    data[message.guild.id] = guildData;
+    saveLevelProgress(data);
+
+    if (progress.level > previousLevel) {
+      await announceLevelUp(message.guild.id, message.author.id, previousLevel, progress.level, progress.xp);
+    }
+  } catch (error) {
+    console.error('تعذر تحديث XP الرسائل:', error);
+  }
+});
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  try {
+    const guildId = newState.guild.id;
+    const memberId = newState.member?.id;
+    if (!memberId || newState.member?.user?.bot) return;
+
+    const key = `${guildId}:${memberId}`;
+    const isJoining = !oldState.channelId && newState.channelId;
+    const isSwitching = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
+    const isLeaving = oldState.channelId && !newState.channelId;
+
+    if (isJoining || isSwitching) {
+      voiceTracking.set(key, Date.now());
+      return;
+    }
+
+    if (isLeaving && voiceTracking.has(key)) {
+      const startedAt = voiceTracking.get(key);
+      const elapsedMs = Date.now() - startedAt;
+      voiceTracking.delete(key);
+
+      const minutes = elapsedMs / 60000;
+      const data = loadLevelProgress();
+      const guildData = data[guildId] || {};
+      const progress = guildData[memberId] || {
+        userId: memberId,
+        messages: 0,
+        voiceMinutes: 0,
+        xp: 0,
+        level: 0
+      };
+
+      const previousLevel = getLevelFromXp(Number(progress.xp || 0));
+      progress.voiceMinutes = Number(progress.voiceMinutes || 0) + minutes;
+      progress.xp = Number(progress.xp || 0) + Math.round(minutes * 8);
+      progress.xp = Math.min(progress.xp, Number.MAX_SAFE_INTEGER);
+      syncUserLevel(progress);
+      guildData[memberId] = progress;
+      data[guildId] = guildData;
+      saveLevelProgress(data);
+
+      if (progress.level > previousLevel) {
+        await announceLevelUp(guildId, memberId, previousLevel, progress.level, progress.xp);
+      }
+    }
+  } catch (error) {
+    console.error('تعذر تحديث XP الصوت:', error);
   }
 });
 
@@ -408,6 +699,60 @@ client.on('interactionCreate', async interaction => {
     config[interaction.guildId] = { ...guildConfig, shortcuts };
     await saveConfig(config);
     return interaction.reply({ content: `تم حذف الاختصار «${name}» بنجاح.`, ephemeral: true });
+  }
+
+  if (interaction.isChatInputCommand() && interaction.commandName === 'setup-levels') {
+    if (!isAdministrator(interaction)) {
+      return interaction.reply({ content: 'عذراً، هذا الأمر مخصص للإدارة فقط.', ephemeral: true });
+    }
+
+    const boardChannel = interaction.options.getChannel('board-channel');
+    const announceChannel = interaction.options.getChannel('announce-channel');
+    if (!boardChannel || !announceChannel || !isUsableTextChannel(boardChannel) || !isUsableTextChannel(announceChannel)) {
+      return interaction.reply({ content: 'اختر روم اللوحة وروم التنبيهات بشكل صحيح.', ephemeral: true });
+    }
+
+    const config = loadLevelConfig();
+    config[interaction.guildId] = {
+      boardChannelId: boardChannel.id,
+      announceChannelId: announceChannel.id,
+      messageId: config[interaction.guildId]?.messageId || null,
+      enabled: true
+    };
+    saveLevelConfig(config);
+    await interaction.reply({ content: 'تم تفعيل لوحة النشاط والفل بنجاح.', ephemeral: true });
+    await refreshLevelBoardForGuild(interaction.guildId);
+    return;
+  }
+
+  if (interaction.isChatInputCommand() && interaction.commandName === 'rank') {
+    const data = loadLevelProgress();
+    const progress = (data[interaction.guildId] || {})[interaction.user.id] || {
+      userId: interaction.user.id,
+      messages: 0,
+      voiceMinutes: 0,
+      xp: 0,
+      level: 0
+    };
+
+    const currentLevel = Math.min(MAX_LEVEL, Number(progress.level || getLevelFromXp(Number(progress.xp || 0))));
+    const currentXp = Number(progress.xp || 0);
+    const nextLevelXp = getLevelThreshold(currentLevel + 1);
+    const bar = getProgressBar(currentXp, currentLevel);
+    const embed = new EmbedBuilder()
+      .setTitle(`🎖️ مستوى ${interaction.user.username}`)
+      .setDescription(`اللقب: ${getLevelName(currentLevel)}`)
+      .setColor(0x5865F2)
+      .addFields(
+        { name: 'فل الحالي', value: `${currentLevel}`, inline: true },
+        { name: 'XP', value: `${currentXp.toLocaleString('en-US')}`, inline: true },
+        { name: 'الرسائل', value: `${progress.messages || 0}`, inline: true },
+        { name: 'الوقت الصوتي', value: `${(progress.voiceMinutes || 0).toFixed(1)} دقيقة`, inline: true },
+        { name: 'التقدم', value: `${bar} \n${currentXp.toLocaleString('en-US')} / ${nextLevelXp.toLocaleString('en-US')} XP`, inline: false }
+      )
+      .setFooter({ text: `الفل الأعلى الممكن: ${MAX_LEVEL}` });
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
   if (interaction.isButton()) {
@@ -733,5 +1078,40 @@ setInterval(async () => {
   }
   await saveDB(updatedNotices);
 }, 60 * 60 * 1000);
+
+setInterval(async () => {
+  const data = loadLevelProgress();
+  for (const guild of client.guilds.cache.values()) {
+    for (const [memberId, state] of voiceTracking.entries()) {
+      if (!memberId.startsWith(`${guild.id}:`)) continue;
+      const memberIdOnly = memberId.split(':')[1];
+      const member = guild.members.cache.get(memberIdOnly);
+      if (!member || member.user.bot) continue;
+
+      const guildData = data[guild.id] || {};
+      const progress = guildData[memberIdOnly] || {
+        userId: memberIdOnly,
+        messages: 0,
+        voiceMinutes: 0,
+        xp: 0,
+        level: 0
+      };
+
+      const previousLevel = getLevelFromXp(Number(progress.xp || 0));
+      progress.voiceMinutes = Number(progress.voiceMinutes || 0) + 1;
+      progress.xp = Number(progress.xp || 0) + 8;
+      syncUserLevel(progress);
+      guildData[memberIdOnly] = progress;
+      data[guild.id] = guildData;
+      if (progress.level > previousLevel) {
+        await announceLevelUp(guild.id, memberIdOnly, previousLevel, progress.level, progress.xp);
+      }
+    }
+  }
+  saveLevelProgress(data);
+  await refreshAllLevelBoards().catch(error => {
+    console.error('تعذر تحديث لوحة النشاط:', error);
+  });
+}, 60 * 1000);
 
 client.login(TOKEN);
